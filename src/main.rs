@@ -294,6 +294,32 @@ async fn provider(state: &AppState) -> Result<Arc<dyn Provider>> {
     Ok(p)
 }
 
+/// Where goose's `xai_oauth` provider keeps the X subscription tokens.
+fn token_cache_path() -> std::path::PathBuf {
+    goose::config::paths::Paths::in_config_dir("xai_oauth/tokens.json")
+}
+
+/// True when a usable sign-in exists: the cache parses and holds a refresh token.
+///
+/// Building the provider proves nothing about this: goose constructs `xai_oauth` without
+/// looking for a token and only fails on the first request. The access token's expiry does
+/// not matter here, because goose renews it from the refresh token on use.
+fn credential_present_at(path: &std::path::Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    value
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .is_some_and(|t| !t.trim().is_empty())
+}
+
+const NOT_SIGNED_IN: &str =
+    "goose is not signed in to xAI. On the host, run `goose configure` and choose xai_oauth.";
+
 fn error(status: StatusCode, message: impl Into<String>, kind: &'static str) -> Response {
     (
         status,
@@ -317,6 +343,7 @@ fn looks_like_auth_failure(msg: &str) -> bool {
         "credential",
         "incorrect api key",
         "expired",
+        "not configured",
     ]
     .iter()
     .any(|k| m.contains(k))
@@ -330,6 +357,14 @@ async fn chat(State(state): State<Arc<AppState>>, Json(req): Json<ChatRequest>) 
     let (system, messages) = to_goose(req.messages);
     let tools = to_tools(req.tools);
     let model = ModelConfig::new(&model_name);
+
+    if !credential_present_at(&token_cache_path()) {
+        return error(
+            StatusCode::UNAUTHORIZED,
+            NOT_SIGNED_IN,
+            "authentication_error",
+        );
+    }
 
     let provider = match provider(&state).await {
         Ok(p) => p,
@@ -391,9 +426,15 @@ async fn chat(State(state): State<Arc<AppState>>, Json(req): Json<ChatRequest>) 
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Response {
-    let ready = provider(&state).await.is_ok();
-    Json(serde_json::json!({ "ok": true, "provider": PROVIDER, "credential": ready }))
-        .into_response()
+    let credential = credential_present_at(&token_cache_path());
+    // Only worth building the provider when there is something to build it with.
+    let provider_ok = credential && provider(&state).await.is_ok();
+    Json(serde_json::json!({
+        "ok": true,
+        "provider": PROVIDER,
+        "credential": credential && provider_ok,
+    }))
+    .into_response()
 }
 
 async fn models() -> Response {
@@ -568,6 +609,39 @@ mod tests {
         ]);
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "t");
+    }
+
+    fn temp_file(name: &str, contents: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("goose-gateway-test-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tokens.json");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn credential_requires_a_refresh_token() {
+        let good = temp_file(
+            "good",
+            r#"{"access_token":"a","refresh_token":"r","expires_at":"2020-01-01T00:00:00Z"}"#,
+        );
+        assert!(
+            credential_present_at(&good),
+            "an expired access token is fine: goose renews it"
+        );
+        let empty = temp_file("empty", r#"{"access_token":"a","refresh_token":"  "}"#);
+        assert!(!credential_present_at(&empty));
+        let garbage = temp_file("garbage", "not json");
+        assert!(!credential_present_at(&garbage));
+        assert!(!credential_present_at(std::path::Path::new(
+            "/definitely/not/here/tokens.json"
+        )));
+    }
+
+    #[test]
+    fn not_configured_is_an_auth_failure() {
+        assert!(looks_like_auth_failure("Provider is not configured"));
     }
 
     #[test]
