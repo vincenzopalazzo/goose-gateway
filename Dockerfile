@@ -8,7 +8,7 @@ COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked && \
+    cargo build --release --locked -j 2 && \
     cp target/release/goose-gateway /goose-gateway
 
 FROM debian:bookworm-slim

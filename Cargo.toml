@@ -35,7 +35,7 @@ process-wrap = { version = "9.1", features = ["process-session"] }
 agent-client-protocol = { git = "https://github.com/agentclientprotocol/rust-sdk", rev = "c97a5203d3392f7f231514d84eea014f9f43e6fb" }
 agent-client-protocol-http = { git = "https://github.com/agentclientprotocol/rust-sdk", rev = "c97a5203d3392f7f231514d84eea014f9f43e6fb" }
 
+# Kept modest on purpose: `goose` is a very large crate, and thin LTO with a single codegen
+# unit pushed peak memory past what a default Docker Desktop VM allows, killing rustc mid-build.
 [profile.release]
-lto = "thin"
-codegen-units = 1
 strip = true
