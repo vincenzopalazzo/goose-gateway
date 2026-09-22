@@ -1,13 +1,13 @@
 //! OpenAI-compatible gateway in front of the goose SDK.
 //!
-//! The web app is browser-only and `goose` is a Rust crate, so this process sits between
-//! them: it accepts `POST /v1/chat/completions` in the OpenAI wire format the app already
-//! speaks, and answers through goose's own `xai_oauth` provider. That provider owns the X
+//! A browser app cannot link `goose`, a Rust crate, so this process sits between them: it
+//! accepts `POST /v1/chat/completions` in the OpenAI wire format most chat clients already
+//! speak, and answers through goose's own `xai_oauth` provider. That provider owns the X
 //! subscription credential and refreshes it itself, which a page cannot do because
 //! `auth.x.ai` sends no CORS headers.
 //!
 //! With `"stream": true` the reply comes back as OpenAI-style server-sent events, fed straight
-//! from goose's own message stream, so text reaches the page as the model writes it.
+//! from goose's own message stream, so text reaches the client as the model writes it.
 //!
 //! Nothing here holds a secret: it reads the token cache `goose configure` wrote, under the
 //! directory `GOOSE_PATH_ROOT` points at (`<root>/config/xai_oauth/tokens.json`).
@@ -33,7 +33,7 @@ use rmcp::model::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::Mutex;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 const PROVIDER: &str = "xai_oauth";
 const DEFAULT_MODEL: &str = "grok-4.7";
@@ -400,6 +400,94 @@ impl ChunkWriter {
 }
 
 // ---------------------------------------------------------------------------
+// Which browser origins may use the gateway
+// ---------------------------------------------------------------------------
+
+/// Browser origins allowed to call the gateway.
+///
+/// The gateway spends the operator's subscription and has no login of its own, so it must not
+/// answer whatever site the operator happens to have open. Local development origins
+/// (`localhost`, `127.0.0.1`, `[::1]`, any port) are always allowed; others are listed in
+/// `GOOSE_GATEWAY_ALLOWED_ORIGINS`, comma separated, or `*` to allow every origin.
+///
+/// Requests without an `Origin` header (curl, server-side clients) are not browser
+/// cross-site requests and pass: anything that can make them on this machine could read the
+/// token file directly anyway.
+#[derive(Clone, Default)]
+struct Origins {
+    any: bool,
+    extra: Vec<String>,
+}
+
+impl Origins {
+    fn parse(list: &str) -> Self {
+        let mut origins = Origins::default();
+        for entry in list.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            if entry == "*" {
+                origins.any = true;
+            } else {
+                origins
+                    .extra
+                    .push(entry.trim_end_matches('/').to_ascii_lowercase());
+            }
+        }
+        origins
+    }
+
+    fn allows(&self, origin: &str) -> bool {
+        let origin = origin.to_ascii_lowercase();
+        self.any || is_local_origin(&origin) || self.extra.contains(&origin)
+    }
+}
+
+/// `http(s)://localhost`, `127.0.0.1` or `[::1]`, with or without a port.
+fn is_local_origin(origin: &str) -> bool {
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let host = if rest.starts_with('[') {
+        rest.split_inclusive(']').next().unwrap_or(rest)
+    } else {
+        rest.split(':').next().unwrap_or(rest)
+    };
+    let port = &rest[host.len()..];
+    let port_ok = port.is_empty()
+        || port
+            .strip_prefix(':')
+            .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]") && port_ok
+}
+
+/// Refuse browser requests from origins not on the list.
+///
+/// CORS alone only stops a page from reading the answer. This also stops the request from
+/// running, which matters for a DNS-rebinding page that the browser treats as same-origin.
+async fn check_origin(
+    State(origins): State<Arc<Origins>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(origin) = request.headers().get(header::ORIGIN) {
+        let allowed = origin.to_str().is_ok_and(|o| origins.allows(o));
+        if !allowed {
+            let shown = origin.to_str().unwrap_or("?").to_string();
+            tracing::warn!("refused request from origin {shown}");
+            return error(
+                StatusCode::FORBIDDEN,
+                format!(
+                    "Origin {shown} may not use this gateway. Add it to GOOSE_GATEWAY_ALLOWED_ORIGINS."
+                ),
+                "permission_error",
+            );
+        }
+    }
+    next.run(request).await
+}
+
+// ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
@@ -611,7 +699,7 @@ async fn stream_chat(
         other => other,
     };
 
-    // A task drives goose and the response drains the channel. When the page goes away the
+    // A task drives goose and the response drains the channel. When the client goes away the
     // send fails, the task returns, and dropping goose's stream cancels the upstream request.
     let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
     tokio::spawn(async move {
@@ -698,10 +786,14 @@ async fn main() -> Result<()> {
         .parse()
         .context("bad listen address")?;
 
-    // The page may be served from localhost or the deployed site; this listens on loopback
-    // (or inside a compose network) and holds no secret of its own, so any origin is fine.
+    let origins = Arc::new(Origins::parse(
+        &std::env::var("GOOSE_GATEWAY_ALLOWED_ORIGINS").unwrap_or_default(),
+    ));
+    let cors_origins = origins.clone();
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            origin.to_str().is_ok_and(|o| cors_origins.allows(o))
+        }))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
@@ -713,6 +805,10 @@ async fn main() -> Result<()> {
         .route("/v1/models", get(models))
         .route("/health", get(health))
         .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            origins.clone(),
+            check_origin,
+        ))
         .layer(cors)
         .layer(axum::middleware::map_response(
             |mut r: Response| async move {
@@ -726,6 +822,14 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding {addr}"))?;
     tracing::info!("goose-gateway listening on http://{addr} (provider {PROVIDER})");
+    if origins.any {
+        tracing::warn!("GOOSE_GATEWAY_ALLOWED_ORIGINS=*: any website can use this gateway");
+    } else if !origins.extra.is_empty() {
+        tracing::info!(
+            "allowed origins beyond localhost: {}",
+            origins.extra.join(", ")
+        );
+    }
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
@@ -892,6 +996,44 @@ mod tests {
         let plain: ChatRequest =
             serde_json::from_value(serde_json::json!({ "messages": [] })).unwrap();
         assert!(!plain.stream, "non-streaming stays the default");
+    }
+
+    #[test]
+    fn local_origins_are_allowed_by_default() {
+        let o = Origins::parse("");
+        for ok in [
+            "http://localhost:5173",
+            "http://127.0.0.1:4321",
+            "http://localhost",
+            "https://localhost:8443",
+            "http://[::1]:3000",
+            "HTTP://LOCALHOST:5173",
+        ] {
+            assert!(o.allows(ok), "{ok}");
+        }
+        for bad in [
+            "https://evil.example",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://localhost:80evil",
+            "http://localhost:",
+            "null",
+            "file://",
+        ] {
+            assert!(!o.allows(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn listed_origins_and_wildcard() {
+        let o = Origins::parse(" https://ldk-server-manager.pages.dev/ , https://b.example ");
+        assert!(o.allows("https://ldk-server-manager.pages.dev"));
+        assert!(o.allows("https://b.example"));
+        assert!(
+            !o.allows("https://ldk-server-manager.pages.dev.evil.example"),
+            "exact match only"
+        );
+        assert!(Origins::parse("*").allows("https://anything.example"));
     }
 
     #[test]

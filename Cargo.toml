@@ -3,8 +3,11 @@ name = "goose-gateway"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.94.1"
-description = "OpenAI-compatible HTTP gateway in front of the goose SDK, so a browser app can use an X subscription"
+description = "OpenAI-compatible HTTP gateway in front of goose, so browser apps can use an xAI SuperGrok (X) subscription"
 license = "MIT"
+repository = "https://github.com/vincenzopalazzo/goose-gateway"
+readme = "README.md"
+keywords = ["goose", "openai", "xai", "grok", "gateway"]
 publish = false
 
 [[bin]]

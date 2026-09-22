@@ -1,0 +1,15 @@
+# Run the gateway on this machine: docker compose up -d
+#
+# Sign in once on the host first (`goose configure`, choose xai_oauth). The token cache lives
+# in goose's config directory, mounted read-write because goose rewrites it when it refreshes.
+services:
+  goose-gateway:
+    build: .
+    environment:
+      # Browser origins allowed besides localhost, comma separated. Leave empty for local use.
+      GOOSE_GATEWAY_ALLOWED_ORIGINS: ${GOOSE_GATEWAY_ALLOWED_ORIGINS:-}
+    volumes:
+      - ${GOOSE_CONFIG_DIR:-~/.config/goose}:/goose/config
+    ports:
+      - "127.0.0.1:8791:8791"
+    restart: unless-stopped
