@@ -12,12 +12,15 @@
 //! Nothing here holds a secret: it reads the token cache `goose configure` wrote, under the
 //! directory `GOOSE_PATH_ROOT` points at (`<root>/config/xai_oauth/tokens.json`).
 
+mod setup;
+
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -35,7 +38,8 @@ use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-const PROVIDER: &str = "xai_oauth";
+/// The goose provider used when a request does not name one.
+const DEFAULT_PROVIDER: &str = "xai_oauth";
 const DEFAULT_MODEL: &str = "grok-4.7";
 
 // ---------------------------------------------------------------------------
@@ -53,6 +57,10 @@ struct ChatRequest {
     stream: bool,
     #[serde(default)]
     stream_options: Option<StreamOptions>,
+    /// Which goose provider answers, e.g. `chatgpt_codex` (not part of OpenAI's API).
+    /// Defaults to `GOOSE_GATEWAY_PROVIDER`, or xai_oauth.
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -492,49 +500,38 @@ async fn check_origin(
 // ---------------------------------------------------------------------------
 
 struct AppState {
-    /// Built lazily on first use so a missing sign-in is reported per request, not at boot.
-    provider: Mutex<Option<Arc<dyn Provider>>>,
+    /// goose providers built so far, by id. Built on first use, so a missing sign-in is
+    /// reported per request rather than at boot, and dropped whenever their setup changes.
+    providers: Mutex<HashMap<String, Arc<dyn Provider>>>,
+    default_provider: String,
+    /// The sign-in in progress, if any (see `setup`).
+    sign_in: std::sync::Mutex<Option<setup::ActiveSignIn>>,
 }
 
-async fn provider(state: &AppState) -> Result<Arc<dyn Provider>> {
-    let mut slot = state.provider.lock().await;
-    if let Some(p) = slot.as_ref() {
+impl AppState {
+    /// A cached provider holds the credentials it was built with; drop it after a change.
+    async fn forget_provider(&self, id: &str) {
+        self.providers.lock().await.remove(id);
+    }
+}
+
+async fn provider(state: &AppState, id: &str) -> Result<Arc<dyn Provider>> {
+    let mut built = state.providers.lock().await;
+    if let Some(p) = built.get(id) {
         return Ok(p.clone());
     }
-    let p = goose::providers::create(PROVIDER, Vec::new())
+    let p = goose::providers::create(id, Vec::new())
         .await
-        .context(
-            "building goose's xai_oauth provider; run `goose configure` and choose xai_oauth first",
-        )?;
-    *slot = Some(p.clone());
+        .with_context(|| format!("building goose's {id} provider"))?;
+    built.insert(id.to_string(), p.clone());
     Ok(p)
 }
 
-/// Where goose's `xai_oauth` provider keeps the X subscription tokens.
-fn token_cache_path() -> std::path::PathBuf {
-    goose::config::paths::Paths::in_config_dir("xai_oauth/tokens.json")
+fn not_set_up(id: &str) -> String {
+    format!(
+        "{id} is not set up in goose yet. Sign in or add its key from your client's provider settings, or run `goose configure` on the gateway host."
+    )
 }
-
-/// True when a usable sign-in exists: the cache parses and holds a refresh token.
-///
-/// Building the provider proves nothing about this: goose constructs `xai_oauth` without
-/// looking for a token and only fails on the first request. The access token's expiry does
-/// not matter here, because goose renews it from the refresh token on use.
-fn credential_present_at(path: &std::path::Path) -> bool {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-        return false;
-    };
-    value
-        .get("refresh_token")
-        .and_then(Value::as_str)
-        .is_some_and(|t| !t.trim().is_empty())
-}
-
-const NOT_SIGNED_IN: &str =
-    "goose is not signed in to xAI. On the host, run `goose configure` and choose xai_oauth.";
 
 fn error(status: StatusCode, message: impl Into<String>, kind: &'static str) -> Response {
     (
@@ -569,9 +566,9 @@ fn looks_like_auth_failure(msg: &str) -> bool {
 ///
 /// A stale provider instance keeps a stale token, so an auth failure drops the cached one and
 /// the next call rebuilds it.
-async fn upstream_failure(state: &AppState, message: String) -> (StatusCode, ErrorBody) {
+async fn upstream_failure(state: &AppState, id: &str, message: String) -> (StatusCode, ErrorBody) {
     let (status, kind) = if looks_like_auth_failure(&message) {
-        *state.provider.lock().await = None;
+        state.forget_provider(id).await;
         (StatusCode::UNAUTHORIZED, "authentication_error")
     } else {
         (StatusCode::BAD_GATEWAY, "upstream_error")
@@ -594,19 +591,32 @@ async fn chat(State(state): State<Arc<AppState>>, Json(req): Json<ChatRequest>) 
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let stream = req.stream;
     let include_usage = req.stream_options.unwrap_or_default().include_usage;
+    let provider_id = req
+        .provider
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| state.default_provider.clone());
     let (system, messages) = to_goose(req.messages);
     let tools = to_tools(req.tools);
     let model = ModelConfig::new(&model_name);
 
-    if !credential_present_at(&token_cache_path()) {
+    if !setup::is_model_provider(&provider_id).await {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!("goose has no chat provider called {provider_id}; see GET /v1/providers"),
+            "invalid_request_error",
+        );
+    }
+    // goose builds most providers without checking for a credential and only fails on the
+    // first request, so ask its own "configured" check first for a clear answer.
+    if !setup::is_configured(&provider_id).await {
         return error(
             StatusCode::UNAUTHORIZED,
-            NOT_SIGNED_IN,
+            not_set_up(&provider_id),
             "authentication_error",
         );
     }
 
-    let provider = match provider(&state).await {
+    let provider = match provider(&state, &provider_id).await {
         Ok(p) => p,
         Err(e) => {
             return error(
@@ -620,6 +630,7 @@ async fn chat(State(state): State<Arc<AppState>>, Json(req): Json<ChatRequest>) 
     if stream {
         return stream_chat(
             state,
+            provider_id,
             provider,
             model,
             model_name,
@@ -634,7 +645,7 @@ async fn chat(State(state): State<Arc<AppState>>, Json(req): Json<ChatRequest>) 
     let (reply, usage) = match provider.complete(&model, &system, &messages, &tools).await {
         Ok(v) => v,
         Err(e) => {
-            let (status, body) = upstream_failure(&state, e.to_string()).await;
+            let (status, body) = upstream_failure(&state, &provider_id, e.to_string()).await;
             return (status, Json(body)).into_response();
         }
     };
@@ -674,6 +685,7 @@ fn sse_json(value: &impl Serialize) -> Event {
 #[allow(clippy::too_many_arguments)]
 async fn stream_chat(
     state: Arc<AppState>,
+    provider_id: String,
     provider: Arc<dyn Provider>,
     model: ModelConfig,
     model_name: String,
@@ -685,7 +697,7 @@ async fn stream_chat(
     let mut upstream = match provider.stream(&model, &system, &messages, &tools).await {
         Ok(s) => s,
         Err(e) => {
-            let (status, body) = upstream_failure(&state, e.to_string()).await;
+            let (status, body) = upstream_failure(&state, &provider_id, e.to_string()).await;
             return (status, Json(body)).into_response();
         }
     };
@@ -693,7 +705,7 @@ async fn stream_chat(
     // surfaces there still gets a real status code, which is what clients branch on.
     let first = match upstream.next().await {
         Some(Err(e)) => {
-            let (status, body) = upstream_failure(&state, e.to_string()).await;
+            let (status, body) = upstream_failure(&state, &provider_id, e.to_string()).await;
             return (status, Json(body)).into_response();
         }
         other => other,
@@ -717,7 +729,7 @@ async fn stream_chat(
                 Err(e) => {
                     // Headers are gone by now, so the failure travels in-band, the way
                     // OpenAI reports mid-stream errors. No [DONE]: the reply is incomplete.
-                    let (_, body) = upstream_failure(&state, e.to_string()).await;
+                    let (_, body) = upstream_failure(&state, &provider_id, e.to_string()).await;
                     let _ = tx.send(sse_json(&body)).await;
                     return;
                 }
@@ -742,39 +754,57 @@ async fn stream_chat(
         .into_response()
 }
 
-async fn health(State(state): State<Arc<AppState>>) -> Response {
-    let credential = credential_present_at(&token_cache_path());
-    // Only worth building the provider when there is something to build it with.
-    let provider_ok = credential && provider(&state).await.is_ok();
+#[derive(Deserialize)]
+struct ProviderQuery {
+    provider: Option<String>,
+}
+
+impl ProviderQuery {
+    fn id(self, state: &AppState) -> String {
+        self.provider
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| state.default_provider.clone())
+    }
+}
+
+/// `{ok, provider, credential}` for `?provider=` (default: the default provider).
+async fn health(State(state): State<Arc<AppState>>, Query(q): Query<ProviderQuery>) -> Response {
+    let id = q.id(&state);
+    let credential = setup::is_model_provider(&id).await && setup::is_configured(&id).await;
     Json(serde_json::json!({
         "ok": true,
-        "provider": PROVIDER,
-        "credential": credential && provider_ok,
+        "provider": id,
+        "credential": credential,
     }))
     .into_response()
 }
 
-async fn models() -> Response {
-    let data: Vec<Value> = [
-        "grok-4.7",
-        "grok-4.6",
-        "grok-4.5",
-        "grok-code-fast-1",
-        "grok-3",
-        "grok-3-mini",
-    ]
-    .iter()
-    .map(|id| serde_json::json!({ "id": id, "object": "model", "owned_by": "xai" }))
-    .collect();
+/// Models goose knows for `?provider=` (default: the default provider).
+async fn models(State(state): State<Arc<AppState>>, Query(q): Query<ProviderQuery>) -> Response {
+    let id = q.id(&state);
+    let Ok(entry) = goose::providers::get_from_registry(&id).await else {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!("goose has no provider called {id}"),
+            "invalid_request_error",
+        );
+    };
+    let data: Vec<Value> = entry
+        .metadata()
+        .known_models
+        .iter()
+        .map(|m| serde_json::json!({ "id": m.name, "object": "model", "owned_by": id }))
+        .collect();
     Json(serde_json::json!({ "object": "list", "data": data })).into_response()
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?),
-        )
+    use tracing_subscriber::prelude::*;
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?))
+        .with(tracing_subscriber::fmt::layer())
+        .with(setup::SignInLogTap)
         .init();
 
     let host = std::env::var("GOOSE_GATEWAY_HOST").unwrap_or_else(|_| "127.0.0.1".into());
@@ -794,15 +824,29 @@ async fn main() -> Result<()> {
         .allow_origin(AllowOrigin::predicate(move |origin, _| {
             origin.to_str().is_ok_and(|o| cors_origins.allows(o))
         }))
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
+    let default_provider =
+        std::env::var("GOOSE_GATEWAY_PROVIDER").unwrap_or_else(|_| DEFAULT_PROVIDER.into());
     let state = Arc::new(AppState {
-        provider: Mutex::new(None),
+        providers: Mutex::new(HashMap::new()),
+        default_provider: default_provider.clone(),
+        sign_in: std::sync::Mutex::new(None),
     });
     let app = Router::new()
         .route("/v1/chat/completions", post(chat))
         .route("/v1/models", get(models))
+        .route("/v1/providers", get(setup::list))
+        .route(
+            "/v1/providers/{id}/config",
+            post(setup::save).delete(setup::remove),
+        )
+        .route("/v1/providers/{id}/sign-in", post(setup::sign_in))
+        .route(
+            "/v1/providers/{id}/sign-in/callback",
+            post(setup::sign_in_callback),
+        )
         .route("/health", get(health))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
@@ -821,7 +865,9 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
-    tracing::info!("goose-gateway listening on http://{addr} (provider {PROVIDER})");
+    tracing::info!(
+        "goose-gateway listening on http://{addr} (default provider {default_provider})"
+    );
     if origins.any {
         tracing::warn!("GOOSE_GATEWAY_ALLOWED_ORIGINS=*: any website can use this gateway");
     } else if !origins.extra.is_empty() {
@@ -1043,34 +1089,6 @@ mod tests {
         ]);
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "t");
-    }
-
-    fn temp_file(name: &str, contents: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("goose-gateway-test-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("tokens.json");
-        std::fs::write(&path, contents).unwrap();
-        path
-    }
-
-    #[test]
-    fn credential_requires_a_refresh_token() {
-        let good = temp_file(
-            "good",
-            r#"{"access_token":"a","refresh_token":"r","expires_at":"2020-01-01T00:00:00Z"}"#,
-        );
-        assert!(
-            credential_present_at(&good),
-            "an expired access token is fine: goose renews it"
-        );
-        let empty = temp_file("empty", r#"{"access_token":"a","refresh_token":"  "}"#);
-        assert!(!credential_present_at(&empty));
-        let garbage = temp_file("garbage", "not json");
-        assert!(!credential_present_at(&garbage));
-        assert!(!credential_present_at(std::path::Path::new(
-            "/definitely/not/here/tokens.json"
-        )));
     }
 
     #[test]

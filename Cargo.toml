@@ -1,9 +1,9 @@
 [package]
 name = "goose-gateway"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.94.1"
-description = "OpenAI-compatible HTTP gateway in front of goose, so browser apps can use an xAI SuperGrok (X) subscription"
+description = "OpenAI-compatible HTTP gateway in front of goose: chat through any goose provider or subscription, and set providers up from a browser"
 license = "MIT"
 repository = "https://github.com/vincenzopalazzo/goose-gateway"
 readme = "README.md"
@@ -26,6 +26,9 @@ tower-http = { version = "0.6", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures = "0.3"
+# Replays a sign-in redirect to goose's localhost listener (plain http, loopback only).
+reqwest = { version = "0.13", default-features = false }
+url = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
