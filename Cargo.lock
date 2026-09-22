@@ -1849,6 +1849,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "futures",
  "goose",
  "goose-provider-types",
  "process-wrap 9.1.0",

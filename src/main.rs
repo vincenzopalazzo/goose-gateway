@@ -6,20 +6,26 @@
 //! subscription credential and refreshes it itself, which a page cannot do because
 //! `auth.x.ai` sends no CORS headers.
 //!
+//! With `"stream": true` the reply comes back as OpenAI-style server-sent events, fed straight
+//! from goose's own message stream, so text reaches the page as the model writes it.
+//!
 //! Nothing here holds a secret: it reads the token cache `goose configure` wrote, under the
 //! directory `GOOSE_PATH_ROOT` points at (`<root>/config/xai_oauth/tokens.json`).
 
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::StreamExt;
 use goose::conversation::message::{Message, MessageContentBlock};
-use goose::providers::base::Provider;
+use goose::providers::base::{Provider, ProviderUsage};
 use goose_provider_types::model::ModelConfig;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ErrorCode, ErrorData, Tool,
@@ -43,6 +49,16 @@ struct ChatRequest {
     messages: Vec<InMessage>,
     #[serde(default)]
     tools: Vec<InTool>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamOptions {
+    #[serde(default)]
+    include_usage: bool,
 }
 
 #[derive(Deserialize)]
@@ -121,7 +137,7 @@ struct OutFunction {
     arguments: String,
 }
 
-#[derive(Serialize, Default)]
+#[derive(Serialize, Default, Clone, Copy)]
 struct Usage {
     prompt_tokens: i64,
     completion_tokens: i64,
@@ -240,6 +256,36 @@ fn to_tools(tools: Vec<InTool>) -> Vec<Tool> {
         .collect()
 }
 
+/// A goose tool request as an OpenAI tool call; `None` when goose could not parse the call.
+fn out_tool_call(req: goose::conversation::message::ToolRequest) -> Option<OutToolCall> {
+    let call = req.tool_call.ok()?;
+    Some(OutToolCall {
+        id: req.id,
+        r#type: "function",
+        function: OutFunction {
+            name: call.name.to_string(),
+            arguments: serde_json::to_string(&call.arguments.unwrap_or_default())
+                .unwrap_or_else(|_| "{}".into()),
+        },
+    })
+}
+
+fn out_usage(usage: &ProviderUsage) -> Usage {
+    let u = &usage.usage;
+    Usage {
+        prompt_tokens: u.input_tokens.unwrap_or_default() as i64,
+        completion_tokens: u.output_tokens.unwrap_or_default() as i64,
+        total_tokens: u.total_tokens.unwrap_or_default() as i64,
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default()
+}
+
 /// Pull text and tool calls out of goose's reply.
 fn from_goose(reply: Message) -> (Option<String>, Vec<OutToolCall>) {
     let mut text_parts = Vec::new();
@@ -247,19 +293,7 @@ fn from_goose(reply: Message) -> (Option<String>, Vec<OutToolCall>) {
     for block in reply.content {
         match block {
             MessageContentBlock::Text(t) if !t.text.is_empty() => text_parts.push(t.text),
-            MessageContentBlock::ToolRequest(req) => {
-                if let Ok(call) = req.tool_call {
-                    calls.push(OutToolCall {
-                        id: req.id,
-                        r#type: "function",
-                        function: OutFunction {
-                            name: call.name.to_string(),
-                            arguments: serde_json::to_string(&call.arguments.unwrap_or_default())
-                                .unwrap_or_else(|_| "{}".into()),
-                        },
-                    });
-                }
-            }
+            MessageContentBlock::ToolRequest(req) => calls.extend(out_tool_call(req)),
             _ => {}
         }
     }
@@ -269,6 +303,100 @@ fn from_goose(reply: Message) -> (Option<String>, Vec<OutToolCall>) {
         Some(text_parts.join("\n"))
     };
     (text, calls)
+}
+
+/// Turns goose's stream items into OpenAI `chat.completion.chunk` objects.
+///
+/// goose yields text in small pieces but tool calls only once complete, so each tool call
+/// goes out whole in a single delta, with the `index` OpenAI clients key their assembly on.
+struct ChunkWriter {
+    id: String,
+    created: i64,
+    model: String,
+    include_usage: bool,
+    /// The first delta carries `role`, as OpenAI's does.
+    started: bool,
+    tool_calls: usize,
+    usage: Usage,
+}
+
+impl ChunkWriter {
+    fn new(model: String, include_usage: bool) -> Self {
+        let created = unix_now();
+        Self {
+            id: format!("chatcmpl-{created}"),
+            created,
+            model,
+            include_usage,
+            started: false,
+            tool_calls: 0,
+            usage: Usage::default(),
+        }
+    }
+
+    fn chunk(&self, choices: Value) -> Value {
+        serde_json::json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": choices,
+        })
+    }
+
+    fn delta(&mut self, mut delta: Value) -> Value {
+        if !self.started {
+            self.started = true;
+            delta["role"] = Value::from("assistant");
+        }
+        self.chunk(serde_json::json!([{ "index": 0, "delta": delta, "finish_reason": null }]))
+    }
+
+    /// Chunks for one item of goose's stream.
+    fn item(&mut self, message: Option<Message>, usage: Option<ProviderUsage>) -> Vec<Value> {
+        if let Some(u) = usage {
+            self.usage = out_usage(&u);
+        }
+        let Some(message) = message else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for block in message.content {
+            match block {
+                MessageContentBlock::Text(t) if !t.text.is_empty() => {
+                    out.push(self.delta(serde_json::json!({ "content": t.text })));
+                }
+                MessageContentBlock::ToolRequest(req) => {
+                    if let Some(call) = out_tool_call(req) {
+                        let mut call = serde_json::to_value(call).unwrap_or_default();
+                        call["index"] = Value::from(self.tool_calls);
+                        self.tool_calls += 1;
+                        out.push(self.delta(serde_json::json!({ "tool_calls": [call] })));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The closing chunk with the finish reason, plus the usage chunk when asked for.
+    fn finish(&mut self) -> Vec<Value> {
+        let reason = if self.tool_calls > 0 {
+            "tool_calls"
+        } else {
+            "stop"
+        };
+        let mut out =
+            vec![self
+                .chunk(serde_json::json!([{ "index": 0, "delta": {}, "finish_reason": reason }]))];
+        if self.include_usage {
+            let mut usage = self.chunk(serde_json::json!([]));
+            usage["usage"] = serde_json::to_value(self.usage).unwrap_or_default();
+            out.push(usage);
+        }
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -349,11 +477,35 @@ fn looks_like_auth_failure(msg: &str) -> bool {
     .any(|k| m.contains(k))
 }
 
+/// Map a goose failure to an OpenAI error, as a status plus body.
+///
+/// A stale provider instance keeps a stale token, so an auth failure drops the cached one and
+/// the next call rebuilds it.
+async fn upstream_failure(state: &AppState, message: String) -> (StatusCode, ErrorBody) {
+    let (status, kind) = if looks_like_auth_failure(&message) {
+        *state.provider.lock().await = None;
+        (StatusCode::UNAUTHORIZED, "authentication_error")
+    } else {
+        (StatusCode::BAD_GATEWAY, "upstream_error")
+    };
+    (
+        status,
+        ErrorBody {
+            error: ErrorDetail {
+                message,
+                r#type: kind,
+            },
+        },
+    )
+}
+
 async fn chat(State(state): State<Arc<AppState>>, Json(req): Json<ChatRequest>) -> Response {
     let model_name = req
         .model
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let stream = req.stream;
+    let include_usage = req.stream_options.unwrap_or_default().include_usage;
     let (system, messages) = to_goose(req.messages);
     let tools = to_tools(req.tools);
     let model = ModelConfig::new(&model_name);
@@ -377,16 +529,25 @@ async fn chat(State(state): State<Arc<AppState>>, Json(req): Json<ChatRequest>) 
         }
     };
 
+    if stream {
+        return stream_chat(
+            state,
+            provider,
+            model,
+            model_name,
+            system,
+            messages,
+            tools,
+            include_usage,
+        )
+        .await;
+    }
+
     let (reply, usage) = match provider.complete(&model, &system, &messages, &tools).await {
         Ok(v) => v,
         Err(e) => {
-            let msg = e.to_string();
-            // A stale provider instance keeps a stale token; drop it so the next call rebuilds.
-            if looks_like_auth_failure(&msg) {
-                *state.provider.lock().await = None;
-                return error(StatusCode::UNAUTHORIZED, msg, "authentication_error");
-            }
-            return error(StatusCode::BAD_GATEWAY, msg, "upstream_error");
+            let (status, body) = upstream_failure(&state, e.to_string()).await;
+            return (status, Json(body)).into_response();
         }
     };
 
@@ -396,11 +557,7 @@ async fn chat(State(state): State<Arc<AppState>>, Json(req): Json<ChatRequest>) 
     } else {
         "tool_calls"
     };
-    let u = usage.usage;
-    let created = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or_default();
+    let created = unix_now();
 
     Json(ChatResponse {
         id: format!("chatcmpl-{created}"),
@@ -416,13 +573,85 @@ async fn chat(State(state): State<Arc<AppState>>, Json(req): Json<ChatRequest>) 
             },
             finish_reason,
         }],
-        usage: Usage {
-            prompt_tokens: u.input_tokens.unwrap_or_default() as i64,
-            completion_tokens: u.output_tokens.unwrap_or_default() as i64,
-            total_tokens: u.total_tokens.unwrap_or_default() as i64,
-        },
+        usage: out_usage(&usage),
     })
     .into_response()
+}
+
+fn sse_json(value: &impl Serialize) -> Event {
+    Event::default().data(serde_json::to_string(value).unwrap_or_else(|_| "{}".into()))
+}
+
+/// Answer as server-sent events straight from goose's message stream.
+#[allow(clippy::too_many_arguments)]
+async fn stream_chat(
+    state: Arc<AppState>,
+    provider: Arc<dyn Provider>,
+    model: ModelConfig,
+    model_name: String,
+    system: String,
+    messages: Vec<Message>,
+    tools: Vec<Tool>,
+    include_usage: bool,
+) -> Response {
+    let mut upstream = match provider.stream(&model, &system, &messages, &tools).await {
+        Ok(s) => s,
+        Err(e) => {
+            let (status, body) = upstream_failure(&state, e.to_string()).await;
+            return (status, Json(body)).into_response();
+        }
+    };
+    // Wait for the first item before committing to a 200: a sign-in or upstream failure that
+    // surfaces there still gets a real status code, which is what clients branch on.
+    let first = match upstream.next().await {
+        Some(Err(e)) => {
+            let (status, body) = upstream_failure(&state, e.to_string()).await;
+            return (status, Json(body)).into_response();
+        }
+        other => other,
+    };
+
+    // A task drives goose and the response drains the channel. When the page goes away the
+    // send fails, the task returns, and dropping goose's stream cancels the upstream request.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
+    tokio::spawn(async move {
+        let mut writer = ChunkWriter::new(model_name, include_usage);
+        let mut next = first;
+        while let Some(item) = next {
+            match item {
+                Ok((message, usage)) => {
+                    for chunk in writer.item(message, usage) {
+                        if tx.send(sse_json(&chunk)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Headers are gone by now, so the failure travels in-band, the way
+                    // OpenAI reports mid-stream errors. No [DONE]: the reply is incomplete.
+                    let (_, body) = upstream_failure(&state, e.to_string()).await;
+                    let _ = tx.send(sse_json(&body)).await;
+                    return;
+                }
+            }
+            next = upstream.next().await;
+        }
+        for chunk in writer.finish() {
+            if tx.send(sse_json(&chunk)).await.is_err() {
+                return;
+            }
+        }
+        let _ = tx.send(Event::default().data("[DONE]")).await;
+    });
+
+    let events = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|event| (Ok::<_, Infallible>(event), rx))
+    });
+    Sse::new(events)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Response {
@@ -600,6 +829,69 @@ mod tests {
         assert_eq!(calls[0].function.name, "create_invoice");
         // Arguments go out as a JSON string, which is what OpenAI clients parse.
         assert_eq!(calls[0].function.arguments, r#"{"amount_sats":50000}"#);
+    }
+
+    fn deltas(chunks: &[Value]) -> Vec<&Value> {
+        chunks.iter().map(|c| &c["choices"][0]["delta"]).collect()
+    }
+
+    #[test]
+    fn stream_text_goes_out_as_content_deltas_then_stop() {
+        let mut w = ChunkWriter::new("grok-4.7".into(), false);
+        let mut out = w.item(Some(Message::assistant().with_text("Hel")), None);
+        out.extend(w.item(Some(Message::assistant().with_text("lo")), None));
+        out.extend(w.item(None, None)); // usage-only items produce nothing
+        let d = deltas(&out);
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0]["role"], "assistant", "the first delta names the role");
+        assert_eq!(d[0]["content"], "Hel");
+        assert!(d[1].get("role").is_none());
+        assert_eq!(d[1]["content"], "lo");
+        assert_eq!(out[0]["object"], "chat.completion.chunk");
+
+        let end = w.finish();
+        assert_eq!(end.len(), 1, "no usage chunk unless asked for");
+        assert_eq!(end[0]["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn stream_tool_calls_are_whole_and_indexed() {
+        let mut w = ChunkWriter::new("grok-4.7".into(), false);
+        let call = |id: &str, name: &str| {
+            Message::assistant()
+                .with_tool_request(id, Ok(CallToolRequestParams::new(name.to_string())))
+        };
+        let mut out = w.item(Some(call("c1", "get_balances")), None);
+        out.extend(w.item(Some(call("c2", "list_channels")), None));
+        let d = deltas(&out);
+        assert_eq!(d[0]["tool_calls"][0]["index"], 0);
+        assert_eq!(d[0]["tool_calls"][0]["id"], "c1");
+        assert_eq!(d[0]["tool_calls"][0]["function"]["name"], "get_balances");
+        assert_eq!(d[0]["tool_calls"][0]["function"]["arguments"], "{}");
+        assert_eq!(d[1]["tool_calls"][0]["index"], 1);
+        assert_eq!(w.finish()[0]["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn stream_usage_chunk_only_when_requested() {
+        let mut w = ChunkWriter::new("grok-4.7".into(), true);
+        let end = w.finish();
+        assert_eq!(end.len(), 2);
+        assert_eq!(end[1]["choices"], serde_json::json!([]));
+        assert_eq!(end[1]["usage"]["total_tokens"], 0);
+    }
+
+    #[test]
+    fn stream_flag_is_read_from_the_request() {
+        let req: ChatRequest = serde_json::from_value(serde_json::json!({
+            "messages": [], "stream": true, "stream_options": { "include_usage": true }
+        }))
+        .unwrap();
+        assert!(req.stream);
+        assert!(req.stream_options.unwrap().include_usage);
+        let plain: ChatRequest =
+            serde_json::from_value(serde_json::json!({ "messages": [] })).unwrap();
+        assert!(!plain.stream, "non-streaming stays the default");
     }
 
     #[test]
