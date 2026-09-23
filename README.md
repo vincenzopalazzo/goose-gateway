@@ -167,6 +167,19 @@ workspace needs. The first build compiles goose's whole dependency tree and take
 The release profile is deliberately plain and the Dockerfile builds with `-j 2`: thin LTO with
 a single codegen unit pushed peak memory past what a default Docker Desktop VM allows.
 
+### Container image
+
+The image is one statically linked (musl) binary on an empty base with a CA bundle: about
+73 MB, with no shell or package manager. It is built for size (`opt-level = "s"`), since the
+gateway waits on the network rather than the CPU; pass `--build-arg OPT_LEVEL=3` to build for
+speed instead (about 87 MB).
+
+It runs as UID/GID `1000:1000`, so a bind-mounted goose config directory must be writable by
+that user; on Linux that is usually already the owner of `~/.config/goose`.
+
+Images are built for amd64 and arm64 on a native runner each (`.github/workflows/image.yml`)
+and pushed to `ghcr.io/vincenzopalazzo/goose-gateway` when a `v*` tag is pushed.
+
 ## License
 
 MIT
