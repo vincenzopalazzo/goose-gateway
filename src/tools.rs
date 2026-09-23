@@ -206,10 +206,12 @@ impl McpTools {
                     }
                     Ok(Err(e)) => return Err(format!("listing tools failed: {e}")),
                     // A server that answers one request at a time may just be busy with a call.
-                    Err(_) if !self.reset_if_idle(handle.generation).await => return Err(format!(
+                    Err(_) if !self.reset_if_idle(handle.generation).await => {
+                        return Err(format!(
                         "listing tools failed: no answer within {}s while a tool call is running",
                         LIST_TIMEOUT.as_secs()
-                    )),
+                    ))
+                    }
                     Err(_) => format!("no answer within {}s", LIST_TIMEOUT.as_secs()),
                 };
             tracing::warn!("listing MCP tools failed ({failure}), restarted the server");
@@ -264,14 +266,16 @@ impl From<CallToolResult> for CallOutput {
             .iter()
             .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
             .collect();
+        // Text first, then structured content; anything else (images, audio, resources) is
+        // passed on as the content blocks' JSON rather than dropped.
         let output = if !text.is_empty() {
             text.join("\n")
+        } else if let Some(structured) = result.structured_content.as_ref() {
+            structured.to_string()
+        } else if !result.content.is_empty() {
+            serde_json::to_string(&result.content).unwrap_or_default()
         } else {
-            result
-                .structured_content
-                .as_ref()
-                .map(Value::to_string)
-                .unwrap_or_default()
+            String::new()
         };
         Self {
             output,
@@ -454,6 +458,10 @@ mod tests {
 
         let failed = CallToolResult::error(vec![ContentBlock::text("insufficient funds")]);
         assert!(CallOutput::from(failed).is_error);
+
+        let image = CallToolResult::success(vec![ContentBlock::image("aGk=", "image/png")]);
+        let out = CallOutput::from(image);
+        assert!(out.output.contains("image/png"), "{}", out.output);
 
         let structured = CallToolResult::structured(serde_json::json!({ "ok": true }));
         let out = CallOutput::from(structured);
