@@ -51,6 +51,9 @@ struct Session {
 struct Handle {
     generation: u64,
     peer: Peer<RoleClient>,
+    /// For a tool call: it counts as in flight from the moment the session was chosen, under
+    /// the same lock a reset takes, so a reset can never slip in between.
+    in_flight: Option<InFlight>,
 }
 
 /// One MCP server, started on first use and restarted after its transport closes.
@@ -111,14 +114,17 @@ impl McpTools {
         &self.program
     }
 
-    /// A handle to the running server, starting it if it is not running.
-    async fn handle(&self) -> Result<Handle, String> {
+    /// A handle to the running server, starting it if it is not running. `for_call` marks a
+    /// tool call in flight before the session lock is released.
+    async fn handle(&self, for_call: bool) -> Result<Handle, String> {
         let mut session = self.session.lock().await;
+        let in_flight = || for_call.then(|| InFlight::new(&self.calls_in_flight));
         if let Some(s) = session.as_ref() {
             if !s.running.is_transport_closed() {
                 return Ok(Handle {
                     generation: s.generation,
                     peer: s.running.peer().clone(),
+                    in_flight: in_flight(),
                 });
             }
             tracing::warn!("MCP server {} exited; starting it again", self.program);
@@ -151,7 +157,11 @@ impl McpTools {
             generation,
             running,
         });
-        Ok(Handle { generation, peer })
+        Ok(Handle {
+            generation,
+            peer,
+            in_flight: in_flight(),
+        })
     }
 
     /// Forget the given session, if it is still the current one, so the next request starts
@@ -165,28 +175,44 @@ impl McpTools {
         }
     }
 
+    /// Like `reset`, but only when no tool call is in flight, decided under the session lock
+    /// that calls take to start. Returns false (and leaves the session) when one is running.
+    async fn reset_if_idle(&self, generation: u64) -> bool {
+        let mut session = self.session.lock().await;
+        if self.calls_in_flight.load(Ordering::SeqCst) > 0 {
+            return false;
+        }
+        if session.as_ref().is_some_and(|s| s.generation == generation) {
+            if let Some(s) = session.take() {
+                let _ = s.running.cancel().await;
+            }
+        }
+        true
+    }
+
     async fn list(&self) -> Result<Vec<Tool>, String> {
         // Listing has no side effects, so a server whose connection died since the last request
         // gets one retry. Calls never do: a call that broke mid-way may still have run.
         // A server that stops answering is treated like one whose connection died.
         for attempt in 0..2 {
-            let handle = self.handle().await?;
+            let handle = self.handle(false).await?;
             let failure =
                 match tokio::time::timeout(LIST_TIMEOUT, handle.peer.list_all_tools()).await {
                     Ok(Ok(tools)) => return Ok(tools),
-                    Ok(Err(e)) if transport_gone(&e, &handle.peer) => format!("{e}"),
+                    Ok(Err(e)) if transport_gone(&e, &handle.peer) => {
+                        // Dead: no call can finish on it either.
+                        self.reset(handle.generation).await;
+                        format!("{e}")
+                    }
                     Ok(Err(e)) => return Err(format!("listing tools failed: {e}")),
                     // A server that answers one request at a time may just be busy with a call.
-                    Err(_) if self.calls_in_flight.load(Ordering::SeqCst) > 0 => {
-                        return Err(format!(
+                    Err(_) if !self.reset_if_idle(handle.generation).await => return Err(format!(
                         "listing tools failed: no answer within {}s while a tool call is running",
                         LIST_TIMEOUT.as_secs()
-                    ))
-                    }
+                    )),
                     Err(_) => format!("no answer within {}s", LIST_TIMEOUT.as_secs()),
                 };
-            tracing::warn!("listing MCP tools failed ({failure}), restarting the server");
-            self.reset(handle.generation).await;
+            tracing::warn!("listing MCP tools failed ({failure}), restarted the server");
             if attempt == 1 {
                 return Err(format!("listing tools failed: {failure}"));
             }
@@ -285,7 +311,7 @@ pub async fn call(
     let Some(tools) = state.tools.as_ref() else {
         return not_configured();
     };
-    let handle = match tools.handle().await {
+    let handle = match tools.handle(true).await {
         Ok(h) => h,
         Err(e) => return error(StatusCode::BAD_GATEWAY, e, "upstream_error"),
     };
@@ -294,7 +320,7 @@ pub async fn call(
     // The call runs in its own task holding the in-flight guard: past the timeout it keeps
     // going (the 504 says it may still complete), and a slow listing must not restart the
     // server under it.
-    let in_flight = InFlight::new(&tools.calls_in_flight);
+    let in_flight = handle.in_flight;
     let peer = handle.peer.clone();
     let call = tokio::spawn(async move {
         let _in_flight = in_flight;
