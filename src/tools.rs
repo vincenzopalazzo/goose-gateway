@@ -97,7 +97,9 @@ impl McpTools {
             tracing::warn!("MCP server {} exited; starting it again", self.program);
         }
         let mut command = Command::new(&self.program);
-        command.args(&self.args);
+        // A start that times out drops the child: make sure that kills it, rather than leaving
+        // one hung process behind per request.
+        command.args(&self.args).kill_on_drop(true);
         let transport = TokioChildProcess::new(command)
             .map_err(|e| format!("could not start {}: {e}", self.program))?;
         let running = match tokio::time::timeout(self.start_timeout, ().serve(transport)).await {
@@ -304,7 +306,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_server_that_never_handshakes_times_out_and_frees_the_queue() {
-        let mut t = McpTools::from_command("sleep 30").unwrap();
+        // An argument no other process on the machine uses, to find ours afterwards.
+        let marker = format!("31.{}", std::process::id());
+        let mut t = McpTools::from_command(&format!("sleep {marker}")).unwrap();
         t.start_timeout = Duration::from_millis(200);
         let first = tokio::time::timeout(Duration::from_secs(5), t.list()).await;
         let err = first.expect("bounded by the start timeout").unwrap_err();
@@ -313,6 +317,13 @@ mod tests {
         let second = tokio::time::timeout(Duration::from_secs(5), t.list()).await;
         assert!(second.expect("not stuck behind the first").is_err());
         assert!(t.session.lock().await.is_none());
+        // Neither timed-out start left its process running.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let left = std::process::Command::new("pgrep")
+            .args(["-f", &format!("sleep {marker}")])
+            .output()
+            .expect("pgrep runs");
+        assert!(left.stdout.is_empty(), "left running: {:?}", left.stdout);
     }
 
     #[test]
