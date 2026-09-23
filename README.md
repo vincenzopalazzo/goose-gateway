@@ -167,6 +167,11 @@ reach it can call every tool.** With tools that move money (such as
 [ldk-server-mcp](https://github.com/lightningdevkit/ldk-server/tree/main/ldk-server-mcp)),
 reach the gateway only through a login, as the LDK Node bundle does.
 
+The container image has nothing but the gateway, so the command has to be added to it: build
+an image `FROM` this one that copies the server in, as the LDK Node bundle's
+[`ldk-node-assistant`](https://github.com/vincenzopalazzo/ldk-node-bundle/tree/main/docker/assistant)
+does, and pass `GOOSE_GATEWAY_MCP_COMMAND` through (`compose.yaml` does).
+
 For ldk-server-mcp, the command can read the node's API key from its storage directory rather
 than an environment variable: point `--config` at a client config naming the network, the
 node's address and `[storage.disk] dir_path`, or mount the storage at `$HOME/.ldk-server` and

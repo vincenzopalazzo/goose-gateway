@@ -36,6 +36,10 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// start, so a server that launches but never answers must not hold them forever.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long listing the tools may take. It has no side effects, so a server that does not
+/// answer in time is restarted.
+const LIST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A started server, numbered so a failure seen on an old one cannot tear down its successor.
 struct Session {
     generation: u64,
@@ -141,15 +145,20 @@ impl McpTools {
     async fn list(&self) -> Result<Vec<Tool>, String> {
         // Listing has no side effects, so a server whose connection died since the last request
         // gets one retry. Calls never do: a call that broke mid-way may still have run.
+        // A server that stops answering is treated like one whose connection died.
         for attempt in 0..2 {
             let handle = self.handle().await?;
-            match handle.peer.list_all_tools().await {
-                Ok(tools) => return Ok(tools),
-                Err(e) if attempt == 0 && transport_gone(&e, &handle.peer) => {
-                    tracing::warn!("listing MCP tools failed, restarting the server: {e}");
-                    self.reset(handle.generation).await;
-                }
-                Err(e) => return Err(format!("listing tools failed: {e}")),
+            let failure =
+                match tokio::time::timeout(LIST_TIMEOUT, handle.peer.list_all_tools()).await {
+                    Ok(Ok(tools)) => return Ok(tools),
+                    Ok(Err(e)) if transport_gone(&e, &handle.peer) => format!("{e}"),
+                    Ok(Err(e)) => return Err(format!("listing tools failed: {e}")),
+                    Err(_) => format!("no answer within {}s", LIST_TIMEOUT.as_secs()),
+                };
+            tracing::warn!("listing MCP tools failed ({failure}), restarting the server");
+            self.reset(handle.generation).await;
+            if attempt == 1 {
+                return Err(format!("listing tools failed: {failure}"));
             }
         }
         unreachable!("the second attempt returns")
