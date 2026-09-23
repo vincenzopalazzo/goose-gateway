@@ -8,6 +8,9 @@ services:
     environment:
       # Browser origins allowed besides localhost, comma separated. Leave empty for local use.
       GOOSE_GATEWAY_ALLOWED_ORIGINS: ${GOOSE_GATEWAY_ALLOWED_ORIGINS:-}
+      # An MCP server whose tools to serve (see README, Tools). The image is scratch: the
+      # command must exist in it, so use an image that adds one (e.g. ldk-node-assistant).
+      GOOSE_GATEWAY_MCP_COMMAND: ${GOOSE_GATEWAY_MCP_COMMAND:-}
     volumes:
       - ${GOOSE_CONFIG_DIR:-~/.config/goose}:/goose/config
     ports:

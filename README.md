@@ -47,12 +47,14 @@ curl -N http://127.0.0.1:8791/v1/chat/completions \
 | ------------------------------------------- | ----------------------------------------------------------------- |
 | `POST /v1/chat/completions`                 | Chat with tools; `system`, `user`, `assistant` and `tool` roles   |
 | `GET /v1/models?provider=`                  | Models goose knows for a provider                                 |
-| `GET /health?provider=`                     | `{"ok":true,"provider":"…","credential":bool}`                    |
+| `GET /health?provider=`                     | `{"ok":true,"provider":"…","credential":bool,"tools":bool}`       |
 | `GET /v1/providers`                         | Every chat provider goose offers, with its setup status           |
 | `POST /v1/providers/{id}/config`            | Save a provider's settings (`{"fields":{"KEY":"value"}}`)         |
 | `DELETE /v1/providers/{id}/config`          | Remove its settings, or sign out                                  |
 | `POST /v1/providers/{id}/sign-in`           | Run a subscription sign-in, streamed as server-sent events        |
 | `POST /v1/providers/{id}/sign-in/callback`  | Deliver a sign-in redirect the browser could not (`{"url":"…"}`)  |
+| `GET /v1/tools`                             | An MCP server's tools, when one is configured (see [Tools](#tools)) |
+| `POST /v1/tools/{name}`                     | Call one with a JSON object of arguments                          |
 
 Chat requests pick a provider with a `"provider"` field (not part of OpenAI's API); without
 one the gateway uses `GOOSE_GATEWAY_PROVIDER`, `xai_oauth` by default. `?provider=` works the
@@ -143,6 +145,38 @@ Keep it bound to loopback (the default, and what `compose.yaml` publishes) unles
 your own authentication in front of it: an allowed origin can also save keys and start
 sign-ins.
 
+## Tools
+
+Set `GOOSE_GATEWAY_MCP_COMMAND` to a stdio MCP server's command line (program and arguments,
+split on spaces) and the gateway serves that server's tools to a client-side agent. It starts
+the server on first use, with the gateway's own environment, and starts it again if it exits.
+
+- `GET /v1/tools` returns `{"tools":[{"name","description","parameters","read_only"?,"destructive"?}]}`:
+  `parameters` is the tool's JSON Schema, ready to pass as `function.parameters` in a chat
+  request, and `read_only`/`destructive` are MCP's hints when the server gives them.
+- `POST /v1/tools/{name}` with the arguments (`{}` for none) returns
+  `{"output":"…","is_error":bool}`: the tool's text, or its structured result as JSON. A tool
+  that fails answers `200` with `is_error: true` and the reason, for the model to read. `502`
+  means the server itself failed, `504` that the call took over two minutes; either way the
+  call may still have happened, so it is never retried.
+
+The model never runs a tool here. The client sends the tools with its chat request, gets tool
+calls back, decides which to run and calls them itself, which is where it should ask its user
+before anything that is not read-only. **The gateway does no approval of its own: whatever can
+reach it can call every tool.** With tools that move money (such as
+[ldk-server-mcp](https://github.com/lightningdevkit/ldk-server/tree/main/ldk-server-mcp)),
+reach the gateway only through a login, as the LDK Node bundle does.
+
+The container image has nothing but the gateway, so the command has to be added to it: build
+an image `FROM` this one that copies the server in, as the LDK Node bundle's
+[`ldk-node-assistant`](https://github.com/vincenzopalazzo/ldk-node-bundle/tree/main/docker/assistant)
+does, and pass `GOOSE_GATEWAY_MCP_COMMAND` through (`compose.yaml` does).
+
+For ldk-server-mcp, the command can read the node's API key from its storage directory rather
+than an environment variable: point `--config` at a client config naming the network, the
+node's address and `[storage.disk] dir_path`, or mount the storage at `$HOME/.ldk-server` and
+set `LDK_BASE_URL`.
+
 ## Configuration
 
 | Variable                        | Default         | Meaning                                                       |
@@ -152,6 +186,7 @@ sign-ins.
 | `GOOSE_GATEWAY_PORT`            | `8791`          |                                                               |
 | `GOOSE_GATEWAY_ALLOWED_ORIGINS` | empty           | extra browser origins, see [Browser access](#browser-access)  |
 | `GOOSE_GATEWAY_PROVIDER`        | `xai_oauth`     | provider for requests that don't name one                     |
+| `GOOSE_GATEWAY_MCP_COMMAND`     | empty           | stdio MCP server whose tools to serve, see [Tools](#tools)     |
 | `GOOSE_CONFIG_DIR`              | `~/.config/goose` | compose only: host directory mounted as goose's config      |
 | `RUST_LOG`                      | `info`          |                                                               |
 

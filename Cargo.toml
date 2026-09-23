@@ -19,9 +19,9 @@ path = "src/main.rs"
 goose = { git = "https://github.com/aaif-goose/goose", rev = "1ba8c9fc2b1fbaf8b55ba523265402090459d308", default-features = false }
 goose-provider-types = { git = "https://github.com/aaif-goose/goose", rev = "1ba8c9fc2b1fbaf8b55ba523265402090459d308", default-features = false }
 # Same major versions goose pins, so the shared types are one crate instance.
-rmcp = { version = "3.0.0", default-features = false }
+rmcp = { version = "3.0.0", default-features = false, features = ["client", "transport-child-process"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
-tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "signal", "process", "time"] }
 tower-http = { version = "0.6", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
