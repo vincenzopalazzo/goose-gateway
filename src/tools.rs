@@ -11,6 +11,7 @@
 //! the tools move money, put the gateway behind a login before turning this on.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Path, State};
@@ -61,20 +62,22 @@ pub struct McpTools {
     start_timeout: Duration,
     /// Tool calls in progress. A slow listing is no reason to restart a server that is busy
     /// running one: that would cut a call (a payment) off halfway.
-    calls_in_flight: AtomicUsize,
+    calls_in_flight: Arc<AtomicUsize>,
 }
 
-/// Counts a tool call as in progress for as long as it lives.
-struct InFlight<'a>(&'a AtomicUsize);
+/// Counts a tool call as in progress for as long as it lives. It is held by the task running
+/// the call, so a call the HTTP handler stopped waiting for still counts until the server
+/// answers or goes away.
+struct InFlight(Arc<AtomicUsize>);
 
-impl<'a> InFlight<'a> {
-    fn new(counter: &'a AtomicUsize) -> Self {
+impl InFlight {
+    fn new(counter: &Arc<AtomicUsize>) -> Self {
         counter.fetch_add(1, Ordering::SeqCst);
-        Self(counter)
+        Self(Arc::clone(counter))
     }
 }
 
-impl Drop for InFlight<'_> {
+impl Drop for InFlight {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
@@ -100,7 +103,7 @@ impl McpTools {
             session: Mutex::new(None),
             started: AtomicU64::new(0),
             start_timeout: START_TIMEOUT,
-            calls_in_flight: AtomicUsize::new(0),
+            calls_in_flight: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -168,21 +171,20 @@ impl McpTools {
         // A server that stops answering is treated like one whose connection died.
         for attempt in 0..2 {
             let handle = self.handle().await?;
-            let failure = match tokio::time::timeout(LIST_TIMEOUT, handle.peer.list_all_tools())
-                .await
-            {
-                Ok(Ok(tools)) => return Ok(tools),
-                Ok(Err(e)) if transport_gone(&e, &handle.peer) => format!("{e}"),
-                Ok(Err(e)) => return Err(format!("listing tools failed: {e}")),
-                // A server that answers one request at a time may just be busy with a call.
-                Err(_) if self.calls_in_flight.load(Ordering::SeqCst) > 0 => {
-                    return Err(format!(
+            let failure =
+                match tokio::time::timeout(LIST_TIMEOUT, handle.peer.list_all_tools()).await {
+                    Ok(Ok(tools)) => return Ok(tools),
+                    Ok(Err(e)) if transport_gone(&e, &handle.peer) => format!("{e}"),
+                    Ok(Err(e)) => return Err(format!("listing tools failed: {e}")),
+                    // A server that answers one request at a time may just be busy with a call.
+                    Err(_) if self.calls_in_flight.load(Ordering::SeqCst) > 0 => {
+                        return Err(format!(
                         "listing tools failed: no answer within {}s while a tool call is running",
                         LIST_TIMEOUT.as_secs()
                     ))
-                }
-                Err(_) => format!("no answer within {}s", LIST_TIMEOUT.as_secs()),
-            };
+                    }
+                    Err(_) => format!("no answer within {}s", LIST_TIMEOUT.as_secs()),
+                };
             tracing::warn!("listing MCP tools failed ({failure}), restarting the server");
             self.reset(handle.generation).await;
             if attempt == 1 {
@@ -289,9 +291,26 @@ pub async fn call(
     };
     tracing::info!("tool call: {name}");
     let params = CallToolRequestParams::new(name.clone()).with_arguments(arguments);
+    // The call runs in its own task holding the in-flight guard: past the timeout it keeps
+    // going (the 504 says it may still complete), and a slow listing must not restart the
+    // server under it.
     let in_flight = InFlight::new(&tools.calls_in_flight);
-    let answer = tokio::time::timeout(CALL_TIMEOUT, handle.peer.call_tool_once(params)).await;
-    drop(in_flight);
+    let peer = handle.peer.clone();
+    let call = tokio::spawn(async move {
+        let _in_flight = in_flight;
+        peer.call_tool_once(params).await
+    });
+    let answer = match tokio::time::timeout(CALL_TIMEOUT, call).await {
+        Ok(Ok(answer)) => Ok(answer),
+        Ok(Err(join)) => {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                format!("{name} failed and may or may not have run: {join}"),
+                "upstream_error",
+            )
+        }
+        Err(elapsed) => Err(elapsed),
+    };
     match answer {
         Ok(Ok(CallToolResponse::Complete(result))) => {
             Json(CallOutput::from(result)).into_response()
