@@ -418,6 +418,10 @@ impl ChunkWriter {
 /// (`localhost`, `127.0.0.1`, `[::1]`, any port) are always allowed; others are listed in
 /// `GOOSE_GATEWAY_ALLOWED_ORIGINS`, comma separated, or `*` to allow every origin.
 ///
+/// Behind a reverse proxy that serves the page and the gateway from one origin, the request
+/// is also allowed when its `Origin` is the address it arrived at (see [`same_origin`]), so a
+/// bundle works on whatever address the device has without listing it.
+///
 /// Requests without an `Origin` header (curl, server-side clients) are not browser
 /// cross-site requests and pass: anything that can make them on this machine could read the
 /// token file directly anyway.
@@ -446,6 +450,47 @@ impl Origins {
         let origin = origin.to_ascii_lowercase();
         self.any || is_local_origin(&origin) || self.extra.contains(&origin)
     }
+}
+
+/// The `host[:port]` part of a `scheme://host[:port]` origin.
+fn origin_authority(origin: &str) -> Option<&str> {
+    let rest = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))?;
+    (!rest.is_empty() && !rest.contains(['/', '?', '#', '@'])).then_some(rest)
+}
+
+/// A hostname public DNS cannot aim at this machine on a web page's behalf: an IP literal,
+/// `localhost`, an mDNS `.local` name, or a Tor `.onion` address.
+fn rebind_safe_host(authority: &str) -> bool {
+    if let Some(v6) = authority.strip_prefix('[') {
+        return v6
+            .split(']')
+            .next()
+            .is_some_and(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok());
+    }
+    let host = authority.split(':').next().unwrap_or(authority);
+    host == "localhost"
+        || host.parse::<std::net::Ipv4Addr>().is_ok()
+        || (host.ends_with(".local") && host.len() > ".local".len())
+        || (host.ends_with(".onion") && host.len() > ".onion".len())
+}
+
+/// True when a browser request comes from the page this very address serves: its `Origin`
+/// names the same `host[:port]` as its `Host`. That is the shape of every request when a
+/// reverse proxy serves the page and the gateway together (the bundle's web container), on
+/// whichever address the device answers to.
+///
+/// Matching alone would let a DNS-rebinding page through: an attacker's domain re-pointed at
+/// this machine is "same origin" too. So it counts only for hosts that page cannot name — see
+/// [`rebind_safe_host`]. A public domain in front of the gateway still has to be listed in
+/// `GOOSE_GATEWAY_ALLOWED_ORIGINS`.
+fn same_origin(origin: &str, host: Option<&str>) -> bool {
+    let (Some(authority), Some(host)) = (origin_authority(origin), host) else {
+        return false;
+    };
+    let authority = authority.to_ascii_lowercase();
+    authority == host.trim().to_ascii_lowercase() && rebind_safe_host(&authority)
 }
 
 /// `http(s)://localhost`, `127.0.0.1` or `[::1]`, with or without a port.
@@ -479,7 +524,15 @@ async fn check_origin(
     next: axum::middleware::Next,
 ) -> Response {
     if let Some(origin) = request.headers().get(header::ORIGIN) {
-        let allowed = origin.to_str().is_ok_and(|o| origins.allows(o));
+        // HTTP/1.1 carries the address in `Host`; HTTP/2 in the request's authority.
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .or_else(|| request.uri().authority().map(|a| a.as_str()));
+        let allowed = origin
+            .to_str()
+            .is_ok_and(|o| origins.allows(o) || same_origin(o, host));
         if !allowed {
             let shown = origin.to_str().unwrap_or("?").to_string();
             tracing::warn!("refused request from origin {shown}");
@@ -1067,6 +1120,44 @@ mod tests {
             "file://",
         ] {
             assert!(!o.allows(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn same_origin_counts_for_addresses_a_page_cannot_rebind() {
+        // A proxy serving the page and the gateway together, on the device's own names.
+        for (origin, host) in [
+            ("http://umbrel.local", "umbrel.local"),
+            ("http://umbrel.local:2150", "umbrel.local:2150"),
+            ("https://adjective-noun.local", "adjective-noun.local"),
+            ("http://192.168.1.20:8080", "192.168.1.20:8080"),
+            ("http://[fd00::20]:8080", "[fd00::20]:8080"),
+            ("http://abcdefghijklmnop.onion", "abcdefghijklmnop.onion"),
+            ("http://Umbrel.Local:2150", "umbrel.local:2150"),
+        ] {
+            assert!(same_origin(origin, Some(host)), "{origin} vs {host}");
+        }
+    }
+
+    #[test]
+    fn same_origin_refuses_rebindable_or_mismatched_hosts() {
+        for (origin, host) in [
+            // A DNS-rebinding page is "same origin" with itself; its domain is not trusted.
+            ("http://evil.example:8080", Some("evil.example:8080")),
+            ("https://mynode.example.com", Some("mynode.example.com")),
+            // Different address, port or missing Host.
+            ("http://umbrel.local:2150", Some("umbrel.local:2151")),
+            ("http://192.168.1.20", Some("192.168.1.21")),
+            ("http://umbrel.local", None),
+            // Degenerate names and malformed origins.
+            ("http://.local", Some(".local")),
+            ("http://.onion", Some(".onion")),
+            ("http://[not-an-ip]:1", Some("[not-an-ip]:1")),
+            ("http://umbrel.local/path", Some("umbrel.local/path")),
+            ("null", Some("null")),
+            ("file://", Some("")),
+        ] {
+            assert!(!same_origin(origin, host), "{origin} vs {host:?}");
         }
     }
 
