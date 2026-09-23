@@ -10,6 +10,7 @@
 //! The gateway does no approval of its own, so whatever can reach it can call every tool. When
 //! the tools move money, put the gateway behind a login before turning this on.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::extract::{Path, State};
@@ -19,7 +20,7 @@ use axum::Json;
 use rmcp::model::{CallToolRequestParams, CallToolResponse, CallToolResult, Tool};
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use rmcp::transport::TokioChildProcess;
-use rmcp::Peer;
+use rmcp::{Peer, ServiceError};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::process::Command;
@@ -31,11 +32,38 @@ use crate::{error, AppState};
 /// client is told the outcome is unknown, not that it failed.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// One MCP server, started on first use and restarted after it goes away.
+/// How long the server gets to start and finish the MCP handshake. Requests queue behind a
+/// start, so a server that launches but never answers must not hold them forever.
+const START_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A started server, numbered so a failure seen on an old one cannot tear down its successor.
+struct Session {
+    generation: u64,
+    running: RunningService<RoleClient, ()>,
+}
+
+/// A handle to one session of the server.
+struct Handle {
+    generation: u64,
+    peer: Peer<RoleClient>,
+}
+
+/// One MCP server, started on first use and restarted after its transport closes.
 pub struct McpTools {
     program: String,
     args: Vec<String>,
-    session: Mutex<Option<RunningService<RoleClient, ()>>>,
+    session: Mutex<Option<Session>>,
+    started: AtomicU64,
+    start_timeout: Duration,
+}
+
+/// A request error that means the connection to the server is gone, rather than the server
+/// answering with a JSON-RPC error while still healthy.
+fn transport_gone(e: &ServiceError, peer: &Peer<RoleClient>) -> bool {
+    matches!(
+        e,
+        ServiceError::TransportClosed | ServiceError::TransportSend(_)
+    ) || peer.is_transport_closed()
 }
 
 impl McpTools {
@@ -47,6 +75,8 @@ impl McpTools {
             program,
             args: words.collect(),
             session: Mutex::new(None),
+            started: AtomicU64::new(0),
+            start_timeout: START_TIMEOUT,
         })
     }
 
@@ -55,11 +85,14 @@ impl McpTools {
     }
 
     /// A handle to the running server, starting it if it is not running.
-    async fn peer(&self) -> Result<Peer<RoleClient>, String> {
+    async fn handle(&self) -> Result<Handle, String> {
         let mut session = self.session.lock().await;
         if let Some(s) = session.as_ref() {
-            if !s.is_transport_closed() {
-                return Ok(s.peer().clone());
+            if !s.running.is_transport_closed() {
+                return Ok(Handle {
+                    generation: s.generation,
+                    peer: s.running.peer().clone(),
+                });
             }
             tracing::warn!("MCP server {} exited; starting it again", self.program);
         }
@@ -67,32 +100,52 @@ impl McpTools {
         command.args(&self.args);
         let transport = TokioChildProcess::new(command)
             .map_err(|e| format!("could not start {}: {e}", self.program))?;
-        let running = ()
-            .serve(transport)
-            .await
-            .map_err(|e| format!("{} did not start as an MCP server: {e}", self.program))?;
+        let running = match tokio::time::timeout(self.start_timeout, ().serve(transport)).await {
+            Ok(Ok(running)) => running,
+            Ok(Err(e)) => {
+                return Err(format!(
+                    "{} did not start as an MCP server: {e}",
+                    self.program
+                ))
+            }
+            Err(_) => {
+                return Err(format!(
+                    "{} did not finish the MCP handshake within {}s",
+                    self.program,
+                    self.start_timeout.as_secs()
+                ))
+            }
+        };
+        let generation = self.started.fetch_add(1, Ordering::Relaxed) + 1;
         let peer = running.peer().clone();
-        *session = Some(running);
-        Ok(peer)
+        *session = Some(Session {
+            generation,
+            running,
+        });
+        Ok(Handle { generation, peer })
     }
 
-    /// Forget the server so the next request starts a fresh one.
-    async fn reset(&self) {
-        if let Some(s) = self.session.lock().await.take() {
-            let _ = s.cancel().await;
+    /// Forget the given session, if it is still the current one, so the next request starts
+    /// a fresh server. A newer session started by another request is left alone.
+    async fn reset(&self, generation: u64) {
+        let mut session = self.session.lock().await;
+        if session.as_ref().is_some_and(|s| s.generation == generation) {
+            if let Some(s) = session.take() {
+                let _ = s.running.cancel().await;
+            }
         }
     }
 
     async fn list(&self) -> Result<Vec<Tool>, String> {
-        // Listing has no side effects, so a server that died since the last request gets one
-        // retry. Calls never do: a call that broke mid-way may still have run.
+        // Listing has no side effects, so a server whose connection died since the last request
+        // gets one retry. Calls never do: a call that broke mid-way may still have run.
         for attempt in 0..2 {
-            let peer = self.peer().await?;
-            match peer.list_all_tools().await {
+            let handle = self.handle().await?;
+            match handle.peer.list_all_tools().await {
                 Ok(tools) => return Ok(tools),
-                Err(e) if attempt == 0 => {
+                Err(e) if attempt == 0 && transport_gone(&e, &handle.peer) => {
                     tracing::warn!("listing MCP tools failed, restarting the server: {e}");
-                    self.reset().await;
+                    self.reset(handle.generation).await;
                 }
                 Err(e) => return Err(format!("listing tools failed: {e}")),
             }
@@ -191,13 +244,13 @@ pub async fn call(
     let Some(tools) = state.tools.as_ref() else {
         return not_configured();
     };
-    let peer = match tools.peer().await {
-        Ok(p) => p,
+    let handle = match tools.handle().await {
+        Ok(h) => h,
         Err(e) => return error(StatusCode::BAD_GATEWAY, e, "upstream_error"),
     };
     tracing::info!("tool call: {name}");
     let params = CallToolRequestParams::new(name.clone()).with_arguments(arguments);
-    match tokio::time::timeout(CALL_TIMEOUT, peer.call_tool_once(params)).await {
+    match tokio::time::timeout(CALL_TIMEOUT, handle.peer.call_tool_once(params)).await {
         Ok(Ok(CallToolResponse::Complete(result))) => {
             Json(CallOutput::from(result)).into_response()
         }
@@ -206,9 +259,18 @@ pub async fn call(
             format!("{name} asked for input or a task; the gateway only takes direct results"),
             "upstream_error",
         ),
+        // The server answered with a JSON-RPC error (unknown tool, invalid arguments): it
+        // refused the call, so this is a definite failure and the session is healthy.
+        Ok(Err(ServiceError::McpError(e))) => Json(CallOutput {
+            output: e.message.into_owned(),
+            is_error: true,
+        })
+        .into_response(),
         Ok(Err(e)) => {
-            // The server may have gone away; start a fresh one next time. Not retried here.
-            tools.reset().await;
+            // Only a dead connection earns a restart; never retried here either way.
+            if transport_gone(&e, &handle.peer) {
+                tools.reset(handle.generation).await;
+            }
             error(
                 StatusCode::BAD_GATEWAY,
                 format!("{name} failed and may or may not have run: {e}"),
@@ -238,6 +300,19 @@ mod tests {
         assert_eq!(t.program, "/usr/local/bin/ldk-server-mcp");
         assert_eq!(t.args, vec!["--verbose"]);
         assert!(McpTools::from_command("   ").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_handshakes_times_out_and_frees_the_queue() {
+        let mut t = McpTools::from_command("sleep 30").unwrap();
+        t.start_timeout = Duration::from_millis(200);
+        let first = tokio::time::timeout(Duration::from_secs(5), t.list()).await;
+        let err = first.expect("bounded by the start timeout").unwrap_err();
+        assert!(err.contains("did not finish the MCP handshake"), "{err}");
+        // The lock was released: the next request gets its own attempt rather than hanging.
+        let second = tokio::time::timeout(Duration::from_secs(5), t.list()).await;
+        assert!(second.expect("not stuck behind the first").is_err());
+        assert!(t.session.lock().await.is_none());
     }
 
     #[test]
