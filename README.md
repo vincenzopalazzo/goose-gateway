@@ -131,7 +131,9 @@ browser origins you allow. Otherwise any website you visit could use it.
   whose `Origin` is that same address is accepted without listing it, as long as the address
   is an IP, `localhost`, a `.local` name or a `.onion` address. A public DNS name can be
   re-pointed at your machine by an attacker's page (DNS rebinding), so a domain still has to
-  be listed. The proxy must pass the browser's `Host` header through.
+  be listed. A `.local` name is answered by your local network, so this trusts the LAN,
+  which can reach the gateway directly anyway. The proxy must pass the browser's `Host`
+  header through.
 - Requests from other origins get `403`, enforced in the server as well as in CORS. That also
   covers DNS-rebinding pages, which a browser treats as same-origin.
 - Requests with no `Origin` header (curl, server-side clients) are accepted. Anything that can

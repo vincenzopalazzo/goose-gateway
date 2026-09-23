@@ -461,7 +461,8 @@ fn origin_authority(origin: &str) -> Option<&str> {
 }
 
 /// A hostname public DNS cannot aim at this machine on a web page's behalf: an IP literal,
-/// `localhost`, an mDNS `.local` name, or a Tor `.onion` address.
+/// `localhost`, an mDNS `.local` name, or a Tor `.onion` address. (`.local` is answered by
+/// the local network, so this trusts the LAN as much as the gateway already does.)
 fn rebind_safe_host(authority: &str) -> bool {
     if let Some(v6) = authority.strip_prefix('[') {
         return v6
@@ -524,7 +525,7 @@ async fn check_origin(
     next: axum::middleware::Next,
 ) -> Response {
     if let Some(origin) = request.headers().get(header::ORIGIN) {
-        // HTTP/1.1 carries the address in `Host`; HTTP/2 in the request's authority.
+        // `Host`, or the authority of an absolute-form request line.
         let host = request
             .headers()
             .get(header::HOST)
