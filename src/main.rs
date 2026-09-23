@@ -13,6 +13,7 @@
 //! directory `GOOSE_PATH_ROOT` points at (`<root>/config/xai_oauth/tokens.json`).
 
 mod setup;
+mod tools;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -560,6 +561,8 @@ struct AppState {
     default_provider: String,
     /// The sign-in in progress, if any (see `setup`).
     sign_in: std::sync::Mutex<Option<setup::ActiveSignIn>>,
+    /// The MCP server whose tools `/v1/tools` serves, when one is configured.
+    tools: Option<tools::McpTools>,
 }
 
 impl AppState {
@@ -829,6 +832,7 @@ async fn health(State(state): State<Arc<AppState>>, Query(q): Query<ProviderQuer
         "ok": true,
         "provider": id,
         "credential": credential,
+        "tools": state.tools.is_some(),
     }))
     .into_response()
 }
@@ -883,10 +887,17 @@ async fn main() -> Result<()> {
 
     let default_provider =
         std::env::var("GOOSE_GATEWAY_PROVIDER").unwrap_or_else(|_| DEFAULT_PROVIDER.into());
+    let tools = std::env::var("GOOSE_GATEWAY_MCP_COMMAND")
+        .ok()
+        .and_then(|c| tools::McpTools::from_command(&c));
+    if let Some(t) = &tools {
+        tracing::info!("serving the tools of MCP server {}", t.program());
+    }
     let state = Arc::new(AppState {
         providers: Mutex::new(HashMap::new()),
         default_provider: default_provider.clone(),
         sign_in: std::sync::Mutex::new(None),
+        tools,
     });
     let app = Router::new()
         .route("/v1/chat/completions", post(chat))
@@ -901,6 +912,8 @@ async fn main() -> Result<()> {
             "/v1/providers/{id}/sign-in/callback",
             post(setup::sign_in_callback),
         )
+        .route("/v1/tools", get(tools::list))
+        .route("/v1/tools/{name}", post(tools::call))
         .route("/health", get(health))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
