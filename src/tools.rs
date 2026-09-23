@@ -10,7 +10,7 @@
 //! The gateway does no approval of its own, so whatever can reach it can call every tool. When
 //! the tools move money, put the gateway behind a login before turning this on.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::extract::{Path, State};
@@ -59,6 +59,25 @@ pub struct McpTools {
     session: Mutex<Option<Session>>,
     started: AtomicU64,
     start_timeout: Duration,
+    /// Tool calls in progress. A slow listing is no reason to restart a server that is busy
+    /// running one: that would cut a call (a payment) off halfway.
+    calls_in_flight: AtomicUsize,
+}
+
+/// Counts a tool call as in progress for as long as it lives.
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl<'a> InFlight<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// A request error that means the connection to the server is gone, rather than the server
@@ -81,6 +100,7 @@ impl McpTools {
             session: Mutex::new(None),
             started: AtomicU64::new(0),
             start_timeout: START_TIMEOUT,
+            calls_in_flight: AtomicUsize::new(0),
         })
     }
 
@@ -148,13 +168,21 @@ impl McpTools {
         // A server that stops answering is treated like one whose connection died.
         for attempt in 0..2 {
             let handle = self.handle().await?;
-            let failure =
-                match tokio::time::timeout(LIST_TIMEOUT, handle.peer.list_all_tools()).await {
-                    Ok(Ok(tools)) => return Ok(tools),
-                    Ok(Err(e)) if transport_gone(&e, &handle.peer) => format!("{e}"),
-                    Ok(Err(e)) => return Err(format!("listing tools failed: {e}")),
-                    Err(_) => format!("no answer within {}s", LIST_TIMEOUT.as_secs()),
-                };
+            let failure = match tokio::time::timeout(LIST_TIMEOUT, handle.peer.list_all_tools())
+                .await
+            {
+                Ok(Ok(tools)) => return Ok(tools),
+                Ok(Err(e)) if transport_gone(&e, &handle.peer) => format!("{e}"),
+                Ok(Err(e)) => return Err(format!("listing tools failed: {e}")),
+                // A server that answers one request at a time may just be busy with a call.
+                Err(_) if self.calls_in_flight.load(Ordering::SeqCst) > 0 => {
+                    return Err(format!(
+                        "listing tools failed: no answer within {}s while a tool call is running",
+                        LIST_TIMEOUT.as_secs()
+                    ))
+                }
+                Err(_) => format!("no answer within {}s", LIST_TIMEOUT.as_secs()),
+            };
             tracing::warn!("listing MCP tools failed ({failure}), restarting the server");
             self.reset(handle.generation).await;
             if attempt == 1 {
@@ -261,7 +289,10 @@ pub async fn call(
     };
     tracing::info!("tool call: {name}");
     let params = CallToolRequestParams::new(name.clone()).with_arguments(arguments);
-    match tokio::time::timeout(CALL_TIMEOUT, handle.peer.call_tool_once(params)).await {
+    let in_flight = InFlight::new(&tools.calls_in_flight);
+    let answer = tokio::time::timeout(CALL_TIMEOUT, handle.peer.call_tool_once(params)).await;
+    drop(in_flight);
+    match answer {
         Ok(Ok(CallToolResponse::Complete(result))) => {
             Json(CallOutput::from(result)).into_response()
         }
@@ -333,6 +364,17 @@ mod tests {
             .output()
             .expect("pgrep runs");
         assert!(left.stdout.is_empty(), "left running: {:?}", left.stdout);
+    }
+
+    #[test]
+    fn in_flight_counts_calls_while_they_live() {
+        let t = McpTools::from_command("x").unwrap();
+        let a = InFlight::new(&t.calls_in_flight);
+        let b = InFlight::new(&t.calls_in_flight);
+        assert_eq!(t.calls_in_flight.load(Ordering::SeqCst), 2);
+        drop(a);
+        drop(b);
+        assert_eq!(t.calls_in_flight.load(Ordering::SeqCst), 0);
     }
 
     #[test]
